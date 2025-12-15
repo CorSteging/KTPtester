@@ -2,6 +2,8 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import os
+import webbrowser
 from pathlib import Path
 from typing import Optional, List
 import threading
@@ -11,11 +13,14 @@ from tkinter import scrolledtext, PhotoImage, BooleanVar
 ICON_FILE = "ktp_icon.png"
 PROJECTS_DIR = Path("projects")
 
+streamlit_process: Optional[subprocess.Popen] = None
 
-# --- Logger Helpers ---
+
+# -------------------------------------------------
+# Logger
+# -------------------------------------------------
 def setup_log_tags(log_widget: scrolledtext.ScrolledText) -> None:
-    """Configure colored tags for different log levels, keeping white background."""
-    log_widget.configure(background="white", foreground="black", font=("Courier", 12))
+    log_widget.configure(background="white", foreground="black", font=("Courier", 11))
     log_widget.tag_config("system", foreground="darkblue")
     log_widget.tag_config("warning", foreground="darkorange")
     log_widget.tag_config("error", foreground="red")
@@ -23,7 +28,6 @@ def setup_log_tags(log_widget: scrolledtext.ScrolledText) -> None:
 
 
 def log_message(log_widget: scrolledtext.ScrolledText, msg: str, tag: str = "system") -> None:
-    """Append a colored log message with a given tag, stripped and clean."""
     for line in msg.rstrip().split("\n"):
         log_widget.insert(tk.END, line + "\n", tag)
     log_widget.see(tk.END)
@@ -31,22 +35,26 @@ def log_message(log_widget: scrolledtext.ScrolledText, msg: str, tag: str = "sys
     print(msg)
 
 
-def run_subprocess_live(cmd: List[str], log_widget: scrolledtext.ScrolledText,
-                        cwd: Optional[Path] = None, tag: str = "student") -> int:
-    """Run a subprocess and stream output live into the log widget with readable colors."""
+def run_subprocess_live(
+    cmd: List[str],
+    log_widget: scrolledtext.ScrolledText,
+    cwd: Optional[Path] = None,
+    tag: str = "student",
+    env: Optional[dict] = None
+) -> int:
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=cwd,
         text=True,
-        bufsize=1
+        bufsize=1,
+        env=env
     )
 
     if process.stdout:
         for line in process.stdout:
-            line = line.rstrip()
-            log_widget.insert(tk.END, line + "\n", tag)
+            log_widget.insert(tk.END, line, tag)
             log_widget.see(tk.END)
             log_widget.update_idletasks()
 
@@ -54,72 +62,155 @@ def run_subprocess_live(cmd: List[str], log_widget: scrolledtext.ScrolledText,
     return process.returncode
 
 
-# --- Repo Management ---
-def clone_repo(repo_url: str, target_path: Path, log_widget: scrolledtext.ScrolledText) -> bool:
-    log_message(log_widget, f"🔄 Cloning {repo_url}", "system")
-    try:
-        run_subprocess_live(["git", "clone", repo_url, str(target_path)], log_widget, tag="system")
-        return True
-    except Exception as e:
-        log_message(log_widget, f"❌ Git clone failed: {e}", "error")
-        return False
-
-
-def checkout_commit(target_path: Path, commit_hash: str, log_widget: scrolledtext.ScrolledText) -> bool:
-    log_message(log_widget, f"🔄 Checking out commit {commit_hash}", "system")
-    try:
-        run_subprocess_live(["git", "-C", str(target_path), "checkout", commit_hash], log_widget, tag="system")
-        return True
-    except Exception as e:
-        log_message(log_widget, f"❌ Git checkout failed: {e}", "error")
-        return False
-
-
-def create_venv(target_path: Path) -> Path:
-    """Create a virtual environment and return the Python executable path."""
-    venv_dir = target_path / "venv"
-    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
-    return venv_dir / ("Scripts/python.exe" if sys.platform.startswith("win") else "bin/python")
-
-
-def install_requirements(python_executable: Path, requirements_file: Path,
-                         log_widget: scrolledtext.ScrolledText) -> None:
-    if requirements_file.exists():
-        log_message(log_widget, "✅ requirements.txt found:", "system")
-        log_message(log_widget, "🔄 Installing dependencies:", "system")
-        run_subprocess_live([str(python_executable), "-m", "pip", "install", "-r", str(requirements_file)], log_widget)
-    else:
-        log_message(log_widget, "⚠️ No requirements.txt found", "warning")
-
-
-def run_main(python_executable: Path, main_file: Path, log_widget: scrolledtext.ScrolledText) -> None:
-    if main_file.exists():
-        log_message(log_widget, "✅ main.py found:", "system")
-        log_message(log_widget, f"🔄 Running {main_file}:", "system")
-        run_subprocess_live([str(python_executable), str(main_file)], log_widget)
-    else:
-        log_message(log_widget, "⚠️ No main.py found", "warning")
-
-
-# --- Input Handling ---
+# -------------------------------------------------
+# Repo helpers
+# -------------------------------------------------
 def parse_repo_input(input_url: str) -> tuple[str, Optional[str]]:
     if "/commit/" in input_url:
-        parts = input_url.split("/commit/")
-        return parts[0] + ".git", parts[1]
+        base, commit = input_url.split("/commit/")
+        return base + ".git", commit
     return input_url, None
 
 
 def extract_repo_info(repo_url: str) -> tuple[str, str]:
-    """
-    Extract username and repo name from GitHub URL.
-    Example: https://github.com/user/repo.git -> ("user", "repo")
-    """
     parts = repo_url.rstrip("/").split("/")
-    username = parts[-2]
-    repo_name = parts[-1].replace(".git", "")
-    return username, repo_name
+    return parts[-2], parts[-1].replace(".git", "")
 
 
+def clone_repo(repo_url: str, target_path: Path, log_widget: scrolledtext.ScrolledText) -> bool:
+    log_message(log_widget, f"🔄 Cloning {repo_url}")
+    return run_subprocess_live(
+        ["git", "clone", repo_url, str(target_path)],
+        log_widget,
+        tag="system"
+    ) == 0
+
+
+def checkout_commit(target_path: Path, commit_hash: str, log_widget: scrolledtext.ScrolledText) -> bool:
+    log_message(log_widget, f"🔄 Checking out commit {commit_hash}")
+    return run_subprocess_live(
+        ["git", "-C", str(target_path), "checkout", commit_hash],
+        log_widget,
+        tag="system"
+    ) == 0
+
+
+# -------------------------------------------------
+# Project inspection
+# -------------------------------------------------
+def find_file(repo_path: Path, filename: str) -> Optional[Path]:
+    for path in repo_path.rglob(filename):
+        return path
+    return None
+
+
+def is_streamlit_project(repo_path: Path) -> bool:
+    requirements = find_file(repo_path, "requirements.txt")
+    if not requirements:
+        return False
+    return "streamlit" in requirements.read_text(errors="ignore").lower()
+
+
+def create_venv(repo_path: Path) -> Path:
+    venv_dir = repo_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+
+    python_path = (
+        venv_dir / "Scripts" / "python.exe"
+        if sys.platform.startswith("win")
+        else venv_dir / "bin" / "python"
+    )
+    return python_path.resolve()
+
+
+def install_requirements(
+    python_executable: Path,
+    repo_path: Path,
+    log_widget: scrolledtext.ScrolledText
+) -> None:
+    requirements_file = find_file(repo_path, "requirements.txt")
+    if not requirements_file:
+        log_message(log_widget, "⚠️ No requirements.txt found", "warning")
+        return
+
+    log_message(log_widget, f"📦 Installing dependencies from {requirements_file.relative_to(repo_path)}")
+    run_subprocess_live(
+        [str(python_executable), "-m", "pip", "install", "-r", str(requirements_file)],
+        log_widget
+    )
+
+
+# -------------------------------------------------
+# Streamlit
+# -------------------------------------------------
+def run_streamlit_app(
+    python_executable: Path,
+    app_file: Path,
+    log_widget: scrolledtext.ScrolledText
+) -> None:
+    global streamlit_process
+
+    log_message(log_widget, f"🌐 Running Streamlit app ({app_file.relative_to(app_file.parents[1])})")
+
+    env = dict(os.environ)
+    env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+    env["STREAMLIT_SERVER_HEADLESS"] = "false"
+
+    streamlit_process = subprocess.Popen(
+        [str(python_executable), "-m", "streamlit", "run", str(app_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=app_file.parent,
+        env=env
+    )
+
+    if streamlit_process.stdout:
+        for line in streamlit_process.stdout:
+            log_widget.insert(tk.END, line, "student")
+            log_widget.see(tk.END)
+            log_widget.update_idletasks()
+
+            if "Local URL:" in line:
+                url = line.split("Local URL:")[-1].strip()
+                webbrowser.open(url)
+
+
+def run_main(
+    python_executable: Path,
+    repo_path: Path,
+    log_widget: scrolledtext.ScrolledText
+) -> None:
+    if is_streamlit_project(repo_path):
+        app_file = (
+            find_file(repo_path, "main.py")
+            or find_file(repo_path, "app.py")
+            or find_file(repo_path, "streamlit_app.py")
+        )
+        if not app_file:
+            log_message(log_widget, "⚠️ Streamlit detected but no app file found", "warning")
+            return
+
+        run_streamlit_app(python_executable, app_file, log_widget)
+        return
+
+    main_file = find_file(repo_path, "main.py")
+    if not main_file:
+        log_message(log_widget, "⚠️ No main.py found", "warning")
+        return
+
+    log_message(log_widget, f"▶️ Running {main_file.relative_to(repo_path)}")
+    run_subprocess_live(
+        [str(python_executable), str(main_file)],
+        log_widget,
+        cwd=main_file.parent
+    )
+
+
+# -------------------------------------------------
+# Execution
+# -------------------------------------------------
 def run_repo(input_url: str, log_widget: scrolledtext.ScrolledText, store_locally: bool) -> None:
     repo_url, commit_hash = parse_repo_input(input_url)
     username, repo_name = extract_repo_info(repo_url)
@@ -127,29 +218,36 @@ def run_repo(input_url: str, log_widget: scrolledtext.ScrolledText, store_locall
     if store_locally:
         target_path = PROJECTS_DIR / username / repo_name
         if target_path.exists():
-            shutil.rmtree(target_path)  # override old version
+            shutil.rmtree(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         tmpdir = tempfile.TemporaryDirectory()
         target_path = Path(tmpdir.name) / repo_name
 
+    target_path = target_path.resolve()
+
     if not clone_repo(repo_url, target_path, log_widget):
         return
+
     if commit_hash and not checkout_commit(target_path, commit_hash, log_widget):
         return
 
     python_executable = create_venv(target_path)
-    run_subprocess_live([str(python_executable), "-m", "pip", "install", "--upgrade", "pip"], log_widget,
-                        tag="system")
-    install_requirements(python_executable, target_path / "requirements.txt", log_widget)
-    run_main(python_executable, target_path / "main.py", log_widget)
 
-    log_message(log_widget, "✅ Finished testing", "system")
+    run_subprocess_live(
+        [str(python_executable), "-m", "pip", "install", "--upgrade", "pip"],
+        log_widget,
+        tag="system"
+    )
+
+    install_requirements(python_executable, target_path, log_widget)
+    run_main(python_executable, target_path, log_widget)
 
 
 def start_run_thread(url: str, log_widget: scrolledtext.ScrolledText, store_var: BooleanVar) -> None:
     if not url.strip():
         return
+
     threading.Thread(
         target=run_repo,
         args=(url.strip(), log_widget, store_var.get()),
@@ -157,56 +255,64 @@ def start_run_thread(url: str, log_widget: scrolledtext.ScrolledText, store_var:
     ).start()
 
 
-# --- GUI Helpers ---
+# -------------------------------------------------
+# GUI
+# -------------------------------------------------
 def center_window(root: tk.Tk, width: int, height: int) -> None:
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = (screen_width // 2) - (width // 2)
-    y = (screen_height // 2) - (height // 2)
+    x = (root.winfo_screenwidth() - width) // 2
+    y = (root.winfo_screenheight() - height) // 2
     root.geometry(f"{width}x{height}+{x}+{y}")
 
 
 def main() -> None:
     root = tk.Tk()
     root.title("KTP Project Tester")
-    window_width, window_height = 600, 650
-    center_window(root, window_width, window_height)
+    center_window(root, 650, 700)
 
-    # Set icon if available
     try:
-        icon_img = PhotoImage(file=ICON_FILE)
-        root.iconphoto(True, icon_img)
+        icon = PhotoImage(file=ICON_FILE)
+        root.iconphoto(True, icon)
     except Exception:
         pass
 
-    # Top label and entry
     tk.Label(root, text="Enter student GitHub repo URL:", font=("Arial", 17)).pack(pady=(10, 0))
+
     entry = tk.Entry(root, width=50, font=("Arial", 14))
     entry.pack(pady=5)
     entry.focus()
 
-    # Store locally checkbox
     store_var = BooleanVar(value=False)
-    tk.Checkbutton(root, text="Store project locally", variable=store_var, font=("Arial", 12)).pack(pady=2)
+    tk.Checkbutton(
+        root,
+        text="Store project locally (projects/<user>/<repo>)",
+        variable=store_var,
+        font=("Arial", 12)
+    ).pack(pady=3)
 
-    # Run button
-    run_button = tk.Button(root, text="Run", command=lambda: start_run_thread(entry.get(), log_widget, store_var))
-    run_button.pack(pady=5)
+    run_button = tk.Button(
+        root,
+        text="Run",
+        font=("Arial", 12),
+        command=lambda: start_run_thread(entry.get(), log_widget, store_var)
+    )
+    run_button.pack(pady=6)
 
-    # Log title
-    tk.Label(root, text="Logs:", font=("Arial", 14, "bold")).pack(pady=(5, 0))
+    tk.Label(root, text="Logs:", font=("Arial", 14, "bold")).pack(pady=(8, 0))
 
-    # Scrollable log
-    log_widget = scrolledtext.ScrolledText(root, width=65, height=30, font=("Courier", 10))
+    log_widget = scrolledtext.ScrolledText(root, width=70, height=30)
     log_widget.pack(pady=5)
     setup_log_tags(log_widget)
 
-    # Footer
-    footer = tk.Label(root, text="Made by Cor Steging", font=("Arial", 8), fg="gray")
-    footer.pack(side="bottom", pady=5)
+    tk.Label(root, text="Made by Cor Steging", font=("Arial", 8), fg="gray").pack(side="bottom", pady=5)
 
-    # Enter key triggers run
-    root.bind("<Return>", lambda event: start_run_thread(entry.get(), log_widget, store_var))
+    def on_close() -> None:
+        global streamlit_process
+        if streamlit_process and streamlit_process.poll() is None:
+            streamlit_process.terminate()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.bind("<Return>", lambda _: start_run_thread(entry.get(), log_widget, store_var))
 
     root.mainloop()
 
